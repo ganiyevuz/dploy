@@ -16,6 +16,7 @@
 # Requires .env in project root with:
 #   SERVER=root@your-server-ip
 #   DEPLOY_DIR=/var/www/myapp/frontend
+#   SSH_KEY=~/.ssh/id_rsa            (optional, auto-detects default key)
 #   BUILD_CMD=npm run build          (optional, default: npm run build)
 #
 set -euo pipefail
@@ -82,8 +83,26 @@ load_env() {
     [[ -n "${SERVER:-}" ]] || err "SERVER is not set in .env"
     [[ -n "${DEPLOY_DIR:-}" ]] || err "DEPLOY_DIR is not set in .env"
 
+    # Resolve SSH key: use provided or find default
+    if [[ -n "${SSH_KEY:-}" ]]; then
+        SSH_KEY="${SSH_KEY/#\~/$HOME}"
+        [[ -f "$SSH_KEY" ]] || err "SSH key not found: $SSH_KEY"
+    else
+        # Auto-detect default key
+        for key in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
+            if [[ -f "$key" ]]; then
+                SSH_KEY="$key"
+                break
+            fi
+        done
+        [[ -n "$SSH_KEY" ]] || err "No SSH key found. Set SSH_KEY in .env or create one: ssh-keygen"
+    fi
+
     # Validate DEPLOY_DIR is absolute path
     [[ "$DEPLOY_DIR" == /* ]] || err "DEPLOY_DIR must be an absolute path (starts with /)"
+
+    # Build SSH/SCP options array
+    SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i "$SSH_KEY")
 
     BUILD_CMD="${BUILD_CMD:-npm run build}"
 }
@@ -91,9 +110,9 @@ load_env() {
 # --- Check SSH connectivity ---
 check_ssh() {
     info "Checking SSH connection to ${BOLD}$SERVER${NC} ..."
-    if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$SERVER" "echo ok" &>/dev/null; then
+    if ! ssh "${SSH_OPTS[@]}" "$SERVER" "echo ok" &>/dev/null; then
         err "Cannot connect to $SERVER
-  Check your SSH key and server address"
+  Check: SSH_KEY=$SSH_KEY, server address, and firewall"
     fi
 }
 
@@ -113,6 +132,7 @@ confirm() {
     echo -e "${BOLD}║${NC} Project : ${CYAN}$(basename "$(pwd)")${NC}"
     echo -e "${BOLD}║${NC} Folder  : ${CYAN}$dist_dir/${NC} ${DIM}($file_count files, $dir_size)${NC}"
     echo -e "${BOLD}║${NC} Server  : ${CYAN}$SERVER${NC}"
+    echo -e "${BOLD}║${NC} SSH Key : ${CYAN}$SSH_KEY${NC}"
     echo -e "${BOLD}║${NC} Remote  : ${CYAN}$DEPLOY_DIR${NC}"
     echo -e "${BOLD}╚══════════════════════════════════════════╝${NC}"
     echo ""
@@ -192,6 +212,7 @@ case "$CMD" in
 # dploy configuration
 SERVER=root@your-server-ip
 DEPLOY_DIR=/var/www/myapp/frontend
+# SSH_KEY=~/.ssh/id_rsa            (optional, auto-detects default key)
 # BUILD_CMD=npm run build
 TEMPLATE
         log "Created .env — edit it with your server details."
@@ -230,11 +251,11 @@ TEMPLATE
         log "Archive ready (${SIZE})"
 
         info "Uploading to ${BOLD}$SERVER${NC} ..."
-        scp -q -o ConnectTimeout=10 "$ARCHIVE_NAME" "$SERVER:/tmp/$ARCHIVE_NAME"
+        scp -q "${SSH_OPTS[@]}" "$ARCHIVE_NAME" "$SERVER:/tmp/$ARCHIVE_NAME"
         log "Upload complete."
 
         info "Deploying on server..."
-        RESULT=$(ssh -o ConnectTimeout=10 "$SERVER" bash -s "$DEPLOY_DIR" "$ARCHIVE_NAME" <<'REMOTE'
+        RESULT=$(ssh "${SSH_OPTS[@]}" "$SERVER" bash -s "$DEPLOY_DIR" "$ARCHIVE_NAME" <<'REMOTE'
 set -euo pipefail
 DEPLOY_DIR="$1"
 ARCHIVE="/tmp/$2"
@@ -275,7 +296,7 @@ REMOTE
 
         info "Rolling back on ${BOLD}$SERVER${NC} ..."
 
-        RESULT=$(ssh -o ConnectTimeout=10 "$SERVER" bash -s "$DEPLOY_DIR" <<'ROLLBACK'
+        RESULT=$(ssh "${SSH_OPTS[@]}" "$SERVER" bash -s "$DEPLOY_DIR" <<'ROLLBACK'
 set -euo pipefail
 DEPLOY_DIR="$1"
 LATEST_BACKUP=$(ls -dt "${DEPLOY_DIR}_backup_"* 2>/dev/null | head -1)
@@ -310,7 +331,7 @@ ROLLBACK
 
         info "Checking deployment at ${BOLD}$SERVER:$DEPLOY_DIR${NC} ..."
 
-        ssh -o ConnectTimeout=10 "$SERVER" bash -s "$DEPLOY_DIR" <<'STATUS'
+        ssh "${SSH_OPTS[@]}" "$SERVER" bash -s "$DEPLOY_DIR" <<'STATUS'
 set -euo pipefail
 D="$1"
 
@@ -356,6 +377,7 @@ STATUS
         echo -e "${BOLD}Config (.env):${NC}"
         echo "  SERVER              SSH target (e.g. root@192.168.1.10)"
         echo "  DEPLOY_DIR          Absolute path on server (e.g. /var/www/app)"
+        echo "  SSH_KEY             SSH private key (default: auto-detect)"
         echo "  BUILD_CMD           Build command (default: npm run build)"
         echo ""
         echo -e "${BOLD}Auto-detected build folders:${NC} dist/, build/, out/, .next/"

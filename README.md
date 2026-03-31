@@ -56,6 +56,7 @@ dploy
 ```env
 SERVER=root@your-server-ip
 DEPLOY_DIR=/var/www/myapp/frontend
+# SSH_KEY=~/.ssh/id_rsa
 # BUILD_CMD=npm run build
 ```
 
@@ -63,7 +64,10 @@ DEPLOY_DIR=/var/www/myapp/frontend
 |----------|----------|-------------|
 | `SERVER` | Yes | SSH target (e.g. `root@192.168.1.10`) |
 | `DEPLOY_DIR` | Yes | Absolute path on server |
+| `SSH_KEY` | No | Path to SSH private key (auto-detects `id_ed25519` or `id_rsa`) |
 | `BUILD_CMD` | No | Build command (default: `npm run build`) |
+
+> **Note:** dploy uses SSH key authentication only — no passwords. Make sure your public key is on the server (`ssh-copy-id root@server`).
 
 ## Commands
 
@@ -86,7 +90,7 @@ DEPLOY_DIR=/var/www/myapp/frontend
 
 ## How It Works
 
-1. Reads `SERVER` and `DEPLOY_DIR` from `.env`
+1. Reads `SERVER`, `SSH_KEY`, and `DEPLOY_DIR` from `.env`
 2. Auto-detects build folder (`dist/`, `build/`, `out/`, `.next/`)
 3. Shows deploy summary and asks for confirmation
 4. Archives the build folder and uploads via SCP
