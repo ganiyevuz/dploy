@@ -21,11 +21,14 @@
 #
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 SCRIPT_NAME="dploy"
 INSTALL_PATH="/usr/local/bin/$SCRIPT_NAME"
+REPO="ganiyevuz/dploy"
+REPO_RAW="https://raw.githubusercontent.com/$REPO/main"
 ENV_FILE=".env"
 ARCHIVE_NAME=""
+UPDATE_CHECK_FILE="$HOME/.dploy_last_check"
 
 # --- Colors (disabled if not a terminal) ---
 if [[ -t 1 ]]; then
@@ -44,6 +47,80 @@ log()  { echo -e "${GREEN}✓${NC} $1"; }
 warn() { echo -e "${YELLOW}⚠${NC} $1"; }
 err()  { echo -e "${RED}✗${NC} $1"; exit 1; }
 info() { echo -e "${CYAN}→${NC} $1"; }
+
+# --- Check for updates (once per day, non-blocking) ---
+check_update() {
+    # Skip if checked in last 24h
+    if [[ -f "$UPDATE_CHECK_FILE" ]]; then
+        local last_check
+        last_check=$(cat "$UPDATE_CHECK_FILE" 2>/dev/null || echo 0)
+        local now
+        now=$(date +%s)
+        (( now - last_check < 86400 )) && return 0
+    fi
+
+    # Store check timestamp
+    date +%s > "$UPDATE_CHECK_FILE" 2>/dev/null || true
+
+    # Fetch latest version (timeout 3s, don't block)
+    local latest
+    latest=$(curl -fsSL --connect-timeout 3 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+        | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
+
+    [[ -z "$latest" ]] && return 0
+
+    if [[ "$latest" != "$VERSION" ]]; then
+        echo ""
+        warn "Update available: ${BOLD}v$VERSION${NC} → ${BOLD}v$latest${NC}"
+        echo -e "  Run: ${BOLD}dploy update${NC} to upgrade"
+        echo ""
+    fi
+}
+
+# --- Self-update ---
+self_update() {
+    info "Checking for updates..."
+
+    local latest
+    latest=$(curl -fsSL --connect-timeout 5 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+        | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
+
+    [[ -z "$latest" ]] && err "Could not fetch latest version. Check your internet connection."
+
+    if [[ "$latest" == "$VERSION" ]]; then
+        log "Already on latest version (v$VERSION)"
+        return 0
+    fi
+
+    info "Updating ${BOLD}v$VERSION${NC} → ${BOLD}v$latest${NC} ..."
+
+    local tmp="/tmp/dploy_update_$$"
+    curl -fsSL "$REPO_RAW/dploy.sh" -o "$tmp" || err "Download failed"
+
+    # Verify downloaded file is valid
+    if ! head -1 "$tmp" | grep -q "^#!/bin/bash"; then
+        rm -f "$tmp"
+        err "Downloaded file is not valid"
+    fi
+
+    chmod +x "$tmp"
+
+    # Install to current location
+    local current
+    current=$(realpath "$0")
+
+    if [[ -w "$current" ]]; then
+        mv "$tmp" "$current"
+    else
+        info "Requires sudo to update $current"
+        sudo mv "$tmp" "$current"
+    fi
+
+    # Reset check timer
+    date +%s > "$UPDATE_CHECK_FILE" 2>/dev/null || true
+
+    log "Updated to ${BOLD}v$latest${NC}"
+}
 
 # --- Cleanup on exit ---
 cleanup() {
@@ -232,8 +309,14 @@ TEMPLATE
         [[ "$SKIP_CONFIRM" == "1" ]] && exec "$0" -y deploy || exec "$0" deploy
         ;;
 
+    # --- Update ---
+    update)
+        self_update
+        ;;
+
     # --- Deploy ---
     deploy)
+        check_update
         load_env
 
         DIST_DIR=$(detect_dist) || err "No build folder found!
@@ -368,6 +451,7 @@ STATUS
         echo "  dploy build         Build first, then deploy"
         echo "  dploy rollback      Rollback to previous version"
         echo "  dploy status        Check current deployment on server"
+        echo "  dploy update        Update dploy to latest version"
         echo "  dploy init          Create .env template in current dir"
         echo "  dploy install       Install globally to /usr/local/bin"
         echo ""

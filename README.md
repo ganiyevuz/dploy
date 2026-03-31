@@ -77,6 +77,7 @@ DEPLOY_DIR=/var/www/myapp/frontend
 | `dploy build` | Run build command, then deploy |
 | `dploy rollback` | Restore previous version on server |
 | `dploy status` | Check current deployment info |
+| `dploy update` | Update dploy to latest version |
 | `dploy init` | Create `.env` template |
 | `dploy install` | Install globally to `/usr/local/bin` |
 
