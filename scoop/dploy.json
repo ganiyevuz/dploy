@@ -1,0 +1,17 @@
+{
+    "version": "1.0.0",
+    "description": "Simple CLI to deploy frontend builds to remote servers",
+    "homepage": "https://github.com/ganiyevuz/dploy",
+    "license": "MIT",
+    "url": "https://github.com/ganiyevuz/dploy/archive/refs/tags/v1.0.0.tar.gz",
+    "hash": "UPDATE_THIS_AFTER_RELEASE",
+    "extract_dir": "dploy-1.0.0",
+    "pre_install": "if (!(Get-Command bash -ErrorAction SilentlyContinue)) { Write-Host 'Git Bash or WSL required to run dploy' -ForegroundColor Red; exit 1 }",
+    "bin": [
+        ["dploy.sh", "dploy"]
+    ],
+    "checkver": "github",
+    "autoupdate": {
+        "url": "https://github.com/ganiyevuz/dploy/archive/refs/tags/v$version.tar.gz"
+    }
+}
