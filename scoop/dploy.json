@@ -4,7 +4,7 @@
     "homepage": "https://github.com/ganiyevuz/dploy",
     "license": "MIT",
     "url": "https://github.com/ganiyevuz/dploy/archive/refs/tags/v1.0.0.tar.gz",
-    "hash": "UPDATE_THIS_AFTER_RELEASE",
+    "hash": "62751482728514effbd22206bb878c6ec23f86897f8dc10cbcab016d8c3851be",
     "extract_dir": "dploy-1.0.0",
     "pre_install": "if (!(Get-Command bash -ErrorAction SilentlyContinue)) { Write-Host 'Git Bash or WSL required to run dploy' -ForegroundColor Red; exit 1 }",
     "bin": [
