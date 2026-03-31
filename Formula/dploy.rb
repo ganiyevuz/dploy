@@ -1,8 +1,8 @@
 class Dploy < Formula
   desc "Simple CLI to deploy frontend builds to remote servers"
   homepage "https://github.com/ganiyevuz/dploy"
-  url "https://github.com/ganiyevuz/dploy/archive/refs/tags/v1.1.0.tar.gz"
-  sha256 "3dfaad220f44153f5da1e53634e32a02ed1e772bc4377dc55e5997de5843f3e4"
+  url "https://github.com/ganiyevuz/dploy/archive/refs/tags/v1.2.0.tar.gz"
+  sha256 "92e3212a8ef7fc3e75a9ea4f1b3744efdbeae846fe1bee850893324960e3004e"
   license "MIT"
 
   def install
@@ -10,6 +10,6 @@ class Dploy < Formula
   end
 
   test do
-    assert_match "dploy v1.1.0", shell_output("#{bin}/dploy --version")
+    assert_match "dploy v1.2.0", shell_output("#{bin}/dploy --version")
   end
 end
