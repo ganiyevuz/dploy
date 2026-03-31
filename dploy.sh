@@ -10,25 +10,34 @@
 #   dploy                 — detect dist folder, confirm, deploy
 #   dploy build           — build first, then deploy
 #   dploy rollback        — rollback to previous version on server
-#   dploy init            — create a .env template in current directory
+#   dploy logs            — show deploy history on server
+#   dploy ssh             — SSH into the server
 #   dploy status          — check server connection and current deployment
+#   dploy doctor          — run all checks (SSH, key, permissions, disk)
+#   dploy update          — update dploy to latest version
+#   dploy init            — create config templates (.env, .env.example, .dployignore)
+#   dploy uninstall       — remove dploy from system
 #
 # Requires .env in project root with:
 #   SERVER=root@your-server-ip
 #   DEPLOY_DIR=/var/www/myapp/frontend
 #   SSH_KEY=~/.ssh/id_rsa            (optional, auto-detects default key)
+#   SSH_PORT=22                      (optional, default: 22)
 #   BUILD_CMD=npm run build          (optional, default: npm run build)
+#   POST_DEPLOY_CMD=                 (optional, runs on server after deploy)
 #
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 SCRIPT_NAME="dploy"
 INSTALL_PATH="/usr/local/bin/$SCRIPT_NAME"
 REPO="ganiyevuz/dploy"
 REPO_RAW="https://raw.githubusercontent.com/$REPO/main"
 ENV_FILE=".env"
+IGNORE_FILE=".dployignore"
 ARCHIVE_NAME=""
 UPDATE_CHECK_FILE="$HOME/.dploy_last_check"
+DEPLOY_START=""
 
 # --- Colors (disabled if not a terminal) ---
 if [[ -t 1 ]]; then
@@ -48,26 +57,39 @@ warn() { echo -e "${YELLOW}⚠${NC} $1"; }
 err()  { echo -e "${RED}✗${NC} $1"; exit 1; }
 info() { echo -e "${CYAN}→${NC} $1"; }
 
+# --- Timer ---
+timer_start() { DEPLOY_START=$(date +%s); }
+timer_elapsed() {
+    local elapsed=$(( $(date +%s) - DEPLOY_START ))
+    if (( elapsed >= 60 )); then
+        echo "$(( elapsed / 60 ))m $(( elapsed % 60 ))s"
+    else
+        echo "${elapsed}s"
+    fi
+}
+
+# --- Cleanup on exit ---
+cleanup() {
+    [[ -n "$ARCHIVE_NAME" && -f "$ARCHIVE_NAME" ]] && rm -f "$ARCHIVE_NAME"
+}
+trap cleanup EXIT
+
 # --- Check for updates (once per day, non-blocking) ---
 check_update() {
-    # Skip if checked in last 24h
     if [[ -f "$UPDATE_CHECK_FILE" ]]; then
-        local last_check
+        local last_check now
         last_check=$(cat "$UPDATE_CHECK_FILE" 2>/dev/null || echo 0)
-        local now
         now=$(date +%s)
         (( now - last_check < 86400 )) && return 0
     fi
 
-    # Store check timestamp
     date +%s > "$UPDATE_CHECK_FILE" 2>/dev/null || true
 
-    # Fetch latest version (timeout 3s, don't block)
     local latest
     latest=$(curl -fsSL --connect-timeout 3 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
-        | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
+        | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/') || true
 
-    [[ -z "$latest" ]] && return 0
+    [[ -z "${latest:-}" ]] && return 0
 
     if [[ "$latest" != "$VERSION" ]]; then
         echo ""
@@ -97,7 +119,6 @@ self_update() {
     local tmp="/tmp/dploy_update_$$"
     curl -fsSL "$REPO_RAW/dploy.sh" -o "$tmp" || err "Download failed"
 
-    # Verify downloaded file is valid
     if ! head -1 "$tmp" | grep -q "^#!/bin/bash"; then
         rm -f "$tmp"
         err "Downloaded file is not valid"
@@ -105,7 +126,6 @@ self_update() {
 
     chmod +x "$tmp"
 
-    # Install to current location
     local current
     current=$(realpath "$0")
 
@@ -116,17 +136,9 @@ self_update() {
         sudo mv "$tmp" "$current"
     fi
 
-    # Reset check timer
     date +%s > "$UPDATE_CHECK_FILE" 2>/dev/null || true
-
     log "Updated to ${BOLD}v$latest${NC}"
 }
-
-# --- Cleanup on exit ---
-cleanup() {
-    [[ -n "$ARCHIVE_NAME" && -f "$ARCHIVE_NAME" ]] && rm -f "$ARCHIVE_NAME"
-}
-trap cleanup EXIT
 
 # --- Detect build/dist folder ---
 detect_dist() {
@@ -146,10 +158,8 @@ load_env() {
   Run: ${BOLD}dploy init${NC} to create one"
 
     while IFS='=' read -r key value; do
-        # Skip comments and empty lines
         [[ "$key" =~ ^[[:space:]]*# ]] && continue
         [[ -z "$key" ]] && continue
-        # Strip surrounding whitespace and quotes
         key=$(echo "$key" | xargs)
         value=$(echo "$value" | xargs)
         value="${value%\"}" && value="${value#\"}"
@@ -160,12 +170,12 @@ load_env() {
     [[ -n "${SERVER:-}" ]] || err "SERVER is not set in .env"
     [[ -n "${DEPLOY_DIR:-}" ]] || err "DEPLOY_DIR is not set in .env"
 
-    # Resolve SSH key: use provided or find default
+    # Resolve SSH key
     if [[ -n "${SSH_KEY:-}" ]]; then
         SSH_KEY="${SSH_KEY/#\~/$HOME}"
         [[ -f "$SSH_KEY" ]] || err "SSH key not found: $SSH_KEY"
     else
-        # Auto-detect default key
+        SSH_KEY=""
         for key in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
             if [[ -f "$key" ]]; then
                 SSH_KEY="$key"
@@ -175,21 +185,65 @@ load_env() {
         [[ -n "$SSH_KEY" ]] || err "No SSH key found. Set SSH_KEY in .env or create one: ssh-keygen"
     fi
 
-    # Validate DEPLOY_DIR is absolute path
+    SSH_PORT="${SSH_PORT:-22}"
+
     [[ "$DEPLOY_DIR" == /* ]] || err "DEPLOY_DIR must be an absolute path (starts with /)"
 
-    # Build SSH/SCP options array
-    SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i "$SSH_KEY")
+    # Build SSH/SCP options
+    SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i "$SSH_KEY" -p "$SSH_PORT")
+    SCP_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i "$SSH_KEY" -P "$SSH_PORT")
 
     BUILD_CMD="${BUILD_CMD:-npm run build}"
+    POST_DEPLOY_CMD="${POST_DEPLOY_CMD:-}"
+}
+
+# --- Security warnings (non-blocking) ---
+check_security() {
+    local ssh_user="${SERVER%%@*}"
+    if [[ "$ssh_user" == "root" ]]; then
+        warn "Deploying as ${BOLD}root${NC} — consider a dedicated deploy user"
+        echo -e "  ${DIM}Create one: adduser deploy && mkdir -p $DEPLOY_DIR && chown deploy:deploy $DEPLOY_DIR${NC}"
+    fi
+
+    case "$DEPLOY_DIR" in
+        /|/etc|/etc/*|/usr|/usr/*|/var|/root|/root/*|/bin|/bin/*|/sbin|/sbin/*)
+            warn "DEPLOY_DIR=${BOLD}$DEPLOY_DIR${NC} is a sensitive system path"
+            ;;
+    esac
 }
 
 # --- Check SSH connectivity ---
 check_ssh() {
-    info "Checking SSH connection to ${BOLD}$SERVER${NC} ..."
+    info "Checking SSH connection to ${BOLD}$SERVER:$SSH_PORT${NC} ..."
     if ! ssh "${SSH_OPTS[@]}" "$SERVER" "echo ok" &>/dev/null; then
-        err "Cannot connect to $SERVER
-  Check: SSH_KEY=$SSH_KEY, server address, and firewall"
+        err "Cannot connect to $SERVER:$SSH_PORT
+  Check: SSH_KEY=$SSH_KEY, server address, port, and firewall"
+    fi
+}
+
+# --- Check write permission on server ---
+check_permissions() {
+    local perm_check
+    perm_check=$(ssh "${SSH_OPTS[@]}" "$SERVER" bash -s "$DEPLOY_DIR" <<'PERMCHECK'
+set -euo pipefail
+D="$1"
+while [[ ! -d "$D" && "$D" != "/" ]]; do
+    D=$(dirname "$D")
+done
+if [[ -w "$D" ]]; then
+    echo "OK"
+else
+    echo "FAIL:$D"
+fi
+PERMCHECK
+    )
+
+    if [[ "$perm_check" == FAIL:* ]]; then
+        local blocked_dir="${perm_check#FAIL:}"
+        local ssh_user="${SERVER%%@*}"
+        err "No write permission to ${BOLD}$blocked_dir${NC}
+  Fix: chown $ssh_user $DEPLOY_DIR
+  Or use a user with access to this directory"
     fi
 }
 
@@ -208,13 +262,16 @@ confirm() {
     echo -e "${BOLD}╠══════════════════════════════════════════╣${NC}"
     echo -e "${BOLD}║${NC} Project : ${CYAN}$(basename "$(pwd)")${NC}"
     echo -e "${BOLD}║${NC} Folder  : ${CYAN}$dist_dir/${NC} ${DIM}($file_count files, $dir_size)${NC}"
-    echo -e "${BOLD}║${NC} Server  : ${CYAN}$SERVER${NC}"
-    echo -e "${BOLD}║${NC} SSH Key : ${CYAN}$SSH_KEY${NC}"
+    echo -e "${BOLD}║${NC} Server  : ${CYAN}$SERVER:$SSH_PORT${NC}"
+    echo -e "${BOLD}║${NC} SSH Key : ${CYAN}$(basename "$SSH_KEY")${NC}"
     echo -e "${BOLD}║${NC} Remote  : ${CYAN}$DEPLOY_DIR${NC}"
+    [[ -n "$POST_DEPLOY_CMD" ]] && \
+    echo -e "${BOLD}║${NC} Hook    : ${CYAN}$POST_DEPLOY_CMD${NC}"
+    [[ -f "$IGNORE_FILE" ]] && \
+    echo -e "${BOLD}║${NC} Ignore  : ${CYAN}.dployignore${NC} ${DIM}($(wc -l < "$IGNORE_FILE" | tr -d ' ') rules)${NC}"
     echo -e "${BOLD}╚══════════════════════════════════════════╝${NC}"
     echo ""
 
-    # Skip prompt if -y flag is set
     if [[ "${SKIP_CONFIRM:-}" == "1" ]]; then
         log "Auto-confirmed (-y flag)"
         return 0
@@ -228,7 +285,7 @@ confirm() {
 confirm_rollback() {
     echo ""
     warn "This will replace current deployment with the previous backup."
-    echo -e "  Server: ${CYAN}$SERVER${NC}"
+    echo -e "  Server: ${CYAN}$SERVER:$SSH_PORT${NC}"
     echo -e "  Path:   ${CYAN}$DEPLOY_DIR${NC}"
     echo ""
 
@@ -239,6 +296,19 @@ confirm_rollback() {
 
     read -rp "$(echo -e "${YELLOW}Rollback now? [y/N]:${NC} ")" answer
     [[ "$answer" =~ ^[Yy]$ ]] || { warn "Cancelled."; exit 0; }
+}
+
+# --- Build tar exclude args from .dployignore ---
+build_exclude_args() {
+    local excludes=()
+    if [[ -f "$IGNORE_FILE" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "${line// }" ]] && continue
+            excludes+=(--exclude="$line")
+        done < "$IGNORE_FILE"
+    fi
+    echo "${excludes[@]}"
 }
 
 # ============================================================
@@ -278,21 +348,76 @@ case "$CMD" in
         log "Installed ${BOLD}dploy${NC} v$VERSION globally."
         ;;
 
-    # --- Init .env template ---
+    # --- Uninstall ---
+    uninstall)
+        if [[ ! -f "$INSTALL_PATH" ]]; then
+            warn "dploy is not installed at $INSTALL_PATH"
+            exit 0
+        fi
+
+        echo ""
+        warn "This will remove dploy from $INSTALL_PATH"
+        read -rp "$(echo -e "${YELLOW}Uninstall? [y/N]:${NC} ")" answer
+        [[ "$answer" =~ ^[Yy]$ ]] || { warn "Cancelled."; exit 0; }
+
+        sudo rm -f "$INSTALL_PATH"
+        rm -f "$UPDATE_CHECK_FILE"
+        log "dploy has been removed."
+        ;;
+
+    # --- Init config templates ---
     init)
         if [[ -f "$ENV_FILE" ]]; then
             warn ".env already exists:"
             echo -e "${DIM}$(cat "$ENV_FILE")${NC}"
-            exit 0
-        fi
-        cat > "$ENV_FILE" <<'TEMPLATE'
+        else
+            cat > "$ENV_FILE" <<'TEMPLATE'
 # dploy configuration
+#
+# TIP: For better security, use a deploy user instead of root:
+#   adduser deploy && mkdir -p /var/www/myapp && chown deploy:deploy /var/www/myapp
+#
 SERVER=root@your-server-ip
 DEPLOY_DIR=/var/www/myapp/frontend
 # SSH_KEY=~/.ssh/id_rsa            (optional, auto-detects default key)
+# SSH_PORT=22                      (optional, default: 22)
 # BUILD_CMD=npm run build
+# POST_DEPLOY_CMD=systemctl reload nginx
 TEMPLATE
-        log "Created .env — edit it with your server details."
+            log "Created .env — edit it with your server details."
+        fi
+
+        # .env.example (safe to commit)
+        if [[ ! -f ".env.example" ]]; then
+            cat > ".env.example" <<'EXAMPLE'
+# dploy configuration — copy to .env and fill in your values
+# cp .env.example .env
+SERVER=root@your-server-ip
+DEPLOY_DIR=/var/www/myapp/frontend
+# SSH_KEY=~/.ssh/id_rsa
+# SSH_PORT=22
+# BUILD_CMD=npm run build
+# POST_DEPLOY_CMD=systemctl reload nginx
+EXAMPLE
+            log "Created .env.example — safe to commit for teammates."
+        fi
+
+        # .dployignore
+        if [[ ! -f "$IGNORE_FILE" ]]; then
+            cat > "$IGNORE_FILE" <<'IGNOREFILE'
+# dploy ignore — files excluded from deployment
+# Uses tar --exclude patterns (glob syntax)
+
+# Source maps
+*.map
+
+# Dev/test files
+*.test.*
+*.spec.*
+__tests__
+IGNOREFILE
+            log "Created .dployignore — edit to exclude files from deploy."
+        fi
         ;;
 
     # --- Build + Deploy ---
@@ -305,7 +430,6 @@ TEMPLATE
         fi
         log "Build complete."
 
-        # Re-run as deploy (pass flags through)
         [[ "$SKIP_CONFIRM" == "1" ]] && exec "$0" -y deploy || exec "$0" deploy
         ;;
 
@@ -314,10 +438,174 @@ TEMPLATE
         self_update
         ;;
 
+    # --- Doctor (run all checks) ---
+    doctor)
+        echo -e "${BOLD}dploy doctor${NC} v$VERSION"
+        echo ""
+        PASS=0
+        FAIL=0
+        WARN=0
+
+        # 1. Check .env
+        if [[ -f "$ENV_FILE" ]]; then
+            log ".env file found"
+            PASS=$((PASS + 1))
+        else
+            err_msg="${RED}✗${NC} .env file not found — run ${BOLD}dploy init${NC}"
+            echo -e "$err_msg"
+            FAIL=$((FAIL + 1))
+            echo ""
+            echo -e "  ${BOLD}Results:${NC} $PASS passed, $FAIL failed, $WARN warnings"
+            exit 1
+        fi
+
+        load_env
+
+        # 2. Check SSH key
+        if [[ -f "$SSH_KEY" ]]; then
+            log "SSH key found: $(basename "$SSH_KEY")"
+            PASS=$((PASS + 1))
+
+            # Check key permissions
+            KEY_PERMS=$(stat -f '%Lp' "$SSH_KEY" 2>/dev/null || stat -c '%a' "$SSH_KEY" 2>/dev/null)
+            if [[ "$KEY_PERMS" == "600" || "$KEY_PERMS" == "400" ]]; then
+                log "SSH key permissions OK ($KEY_PERMS)"
+                PASS=$((PASS + 1))
+            else
+                warn "SSH key permissions are $KEY_PERMS (should be 600)"
+                echo -e "  ${DIM}Fix: chmod 600 $SSH_KEY${NC}"
+                WARN=$((WARN + 1))
+            fi
+        else
+            echo -e "${RED}✗${NC} SSH key not found"
+            FAIL=$((FAIL + 1))
+        fi
+
+        # 3. Check SSH connection
+        if ssh "${SSH_OPTS[@]}" "$SERVER" "echo ok" &>/dev/null; then
+            log "SSH connection to $SERVER:$SSH_PORT"
+            PASS=$((PASS + 1))
+        else
+            echo -e "${RED}✗${NC} Cannot connect to $SERVER:$SSH_PORT"
+            FAIL=$((FAIL + 1))
+            echo ""
+            echo -e "  ${BOLD}Results:${NC} $PASS passed, $FAIL failed, $WARN warnings"
+            exit 1
+        fi
+
+        # 4. Check root warning
+        SSH_USER="${SERVER%%@*}"
+        if [[ "$SSH_USER" == "root" ]]; then
+            warn "Deploying as root — consider a deploy user"
+            WARN=$((WARN + 1))
+        else
+            log "Non-root user: $SSH_USER"
+            PASS=$((PASS + 1))
+        fi
+
+        # 5. Check write permissions
+        PERM_CHECK=$(ssh "${SSH_OPTS[@]}" "$SERVER" bash -s "$DEPLOY_DIR" <<'PERMCHECK'
+set -euo pipefail
+D="$1"
+while [[ ! -d "$D" && "$D" != "/" ]]; do
+    D=$(dirname "$D")
+done
+if [[ -w "$D" ]]; then echo "OK"; else echo "FAIL:$D"; fi
+PERMCHECK
+        )
+        if [[ "$PERM_CHECK" == "OK" ]]; then
+            log "Write permission to $DEPLOY_DIR"
+            PASS=$((PASS + 1))
+        else
+            echo -e "${RED}✗${NC} No write permission to ${PERM_CHECK#FAIL:}"
+            echo -e "  ${DIM}Fix: chown $SSH_USER $DEPLOY_DIR${NC}"
+            FAIL=$((FAIL + 1))
+        fi
+
+        # 6. Check dangerous paths
+        case "$DEPLOY_DIR" in
+            /|/etc|/etc/*|/usr|/usr/*|/var|/root|/root/*|/bin|/bin/*|/sbin|/sbin/*)
+                warn "DEPLOY_DIR is a sensitive system path: $DEPLOY_DIR"
+                WARN=$((WARN + 1))
+                ;;
+            *)
+                log "DEPLOY_DIR path is safe: $DEPLOY_DIR"
+                PASS=$((PASS + 1))
+                ;;
+        esac
+
+        # 7. Check disk space
+        DISK_INFO=$(ssh "${SSH_OPTS[@]}" "$SERVER" bash -s "$DEPLOY_DIR" <<'DISK'
+set -euo pipefail
+D="$1"
+while [[ ! -d "$D" && "$D" != "/" ]]; do D=$(dirname "$D"); done
+USAGE=$(df "$D" | tail -1 | awk '{print $5}' | tr -d '%')
+FREE=$(df -h "$D" | tail -1 | awk '{print $4}')
+echo "$USAGE:$FREE"
+DISK
+        )
+        DISK_USAGE="${DISK_INFO%%:*}"
+        DISK_FREE="${DISK_INFO#*:}"
+        if (( DISK_USAGE > 90 )); then
+            echo -e "${RED}✗${NC} Disk almost full: ${DISK_USAGE}% used ($DISK_FREE free)"
+            FAIL=$((FAIL + 1))
+        elif (( DISK_USAGE > 80 )); then
+            warn "Disk usage high: ${DISK_USAGE}% used ($DISK_FREE free)"
+            WARN=$((WARN + 1))
+        else
+            log "Disk space OK: ${DISK_USAGE}% used ($DISK_FREE free)"
+            PASS=$((PASS + 1))
+        fi
+
+        # 8. Check .dployignore
+        if [[ -f "$IGNORE_FILE" ]]; then
+            RULE_COUNT=$(grep -cv '^\s*#\|^\s*$' "$IGNORE_FILE" 2>/dev/null || echo 0)
+            log ".dployignore found ($RULE_COUNT rules)"
+            PASS=$((PASS + 1))
+        else
+            warn "No .dployignore — all files will be deployed (including *.map)"
+            WARN=$((WARN + 1))
+        fi
+
+        # 9. Check POST_DEPLOY_CMD
+        if [[ -n "$POST_DEPLOY_CMD" ]]; then
+            if ssh "${SSH_OPTS[@]}" "$SERVER" "command -v ${POST_DEPLOY_CMD%% *}" &>/dev/null; then
+                log "Post-deploy command found: $POST_DEPLOY_CMD"
+                PASS=$((PASS + 1))
+            else
+                warn "Post-deploy command not found on server: ${POST_DEPLOY_CMD%% *}"
+                WARN=$((WARN + 1))
+            fi
+        fi
+
+        # 10. Check build folder
+        if DIST=$(detect_dist); then
+            DIST_FILES=$(find "$DIST" -type f | wc -l | tr -d ' ')
+            log "Build folder detected: $DIST/ ($DIST_FILES files)"
+            PASS=$((PASS + 1))
+        else
+            warn "No build folder found — run your build command first"
+            WARN=$((WARN + 1))
+        fi
+
+        # Summary
+        echo ""
+        if [[ $FAIL -eq 0 && $WARN -eq 0 ]]; then
+            log "${BOLD}All checks passed!${NC} ($PASS/$PASS)"
+        elif [[ $FAIL -eq 0 ]]; then
+            log "${BOLD}$PASS passed${NC}, ${YELLOW}$WARN warnings${NC}"
+        else
+            echo -e "${RED}✗${NC} ${BOLD}$PASS passed${NC}, ${RED}$FAIL failed${NC}, ${YELLOW}$WARN warnings${NC}"
+            exit 1
+        fi
+        ;;
+
     # --- Deploy ---
     deploy)
         check_update
         load_env
+        check_security
+        timer_start
 
         DIST_DIR=$(detect_dist) || err "No build folder found!
   Checked: dist/, build/, out/, .next/
@@ -325,19 +613,30 @@ TEMPLATE
 
         confirm "$DIST_DIR"
         check_ssh
+        check_permissions
 
         ARCHIVE_NAME="dploy_$(date +%s).tar.gz"
 
+        # Build exclude args from .dployignore
+        EXCLUDE_ARGS=""
+        if [[ -f "$IGNORE_FILE" ]]; then
+            EXCLUDE_ARGS=$(build_exclude_args)
+        fi
+
         info "Archiving ${BOLD}$DIST_DIR/${NC} ..."
-        tar -czf "$ARCHIVE_NAME" -C "$DIST_DIR" .
+        step_start=$(date +%s)
+        # shellcheck disable=SC2086
+        tar -czf "$ARCHIVE_NAME" $EXCLUDE_ARGS -C "$DIST_DIR" .
         SIZE=$(du -h "$ARCHIVE_NAME" | cut -f1 | tr -d ' ')
-        log "Archive ready (${SIZE})"
+        log "Archive ready (${SIZE}) ${DIM}$(( $(date +%s) - step_start ))s${NC}"
 
         info "Uploading to ${BOLD}$SERVER${NC} ..."
-        scp -q "${SSH_OPTS[@]}" "$ARCHIVE_NAME" "$SERVER:/tmp/$ARCHIVE_NAME"
-        log "Upload complete."
+        step_start=$(date +%s)
+        scp -q "${SCP_OPTS[@]}" "$ARCHIVE_NAME" "$SERVER:/tmp/$ARCHIVE_NAME"
+        log "Upload complete ${DIM}$(( $(date +%s) - step_start ))s${NC}"
 
         info "Deploying on server..."
+        step_start=$(date +%s)
         RESULT=$(ssh "${SSH_OPTS[@]}" "$SERVER" bash -s "$DEPLOY_DIR" "$ARCHIVE_NAME" <<'REMOTE'
 set -euo pipefail
 DEPLOY_DIR="$1"
@@ -363,48 +662,197 @@ echo "OK:$FILE_COUNT"
 REMOTE
         )
 
-        if [[ "$RESULT" == OK:* ]]; then
-            log "Deployed ${BOLD}${RESULT#OK:}${NC} files to ${BOLD}$SERVER:$DEPLOY_DIR${NC}"
-        else
+        if [[ "$RESULT" != OK:* ]]; then
             err "Deploy failed on server!
   $RESULT"
         fi
+
+        log "Extracted ${BOLD}${RESULT#OK:}${NC} files ${DIM}$(( $(date +%s) - step_start ))s${NC}"
+
+        # Run post-deploy hook
+        if [[ -n "$POST_DEPLOY_CMD" ]]; then
+            info "Running post-deploy: ${BOLD}$POST_DEPLOY_CMD${NC}"
+            step_start=$(date +%s)
+            HOOK_OUTPUT=$(ssh "${SSH_OPTS[@]}" "$SERVER" "$POST_DEPLOY_CMD" 2>&1) && HOOK_OK=1 || HOOK_OK=0
+
+            if [[ "$HOOK_OK" == "1" ]]; then
+                log "Post-deploy complete ${DIM}$(( $(date +%s) - step_start ))s${NC}"
+            else
+                warn "Post-deploy command failed (deploy itself succeeded)"
+                if echo "$HOOK_OUTPUT" | grep -qi "permission denied\|not permitted\|sudo"; then
+                    SSH_USER="${SERVER%%@*}"
+                    echo -e "  ${DIM}Hint: add passwordless sudo for this command:${NC}"
+                    echo -e "  ${DIM}  echo '$SSH_USER ALL=(ALL) NOPASSWD: $POST_DEPLOY_CMD' | sudo tee /etc/sudoers.d/dploy${NC}"
+                else
+                    echo -e "  ${DIM}$HOOK_OUTPUT${NC}"
+                fi
+            fi
+        fi
+
+        ARCHIVE_NAME=""
+        echo ""
+        log "Deployed to ${BOLD}$SERVER:$DEPLOY_DIR${NC} in ${BOLD}$(timer_elapsed)${NC}"
         ;;
 
     # --- Rollback ---
     rollback)
         load_env
-        confirm_rollback
         check_ssh
 
-        info "Rolling back on ${BOLD}$SERVER${NC} ..."
+        # Fetch available backups
+        BACKUP_LIST=$(ssh "${SSH_OPTS[@]}" "$SERVER" bash -s "$DEPLOY_DIR" <<'LIST_BACKUPS'
+set -euo pipefail
+D="$1"
+BACKUPS=$(ls -dt "${D}_backup_"* 2>/dev/null) || true
+if [[ -z "${BACKUPS:-}" ]]; then
+    echo "NONE"
+    exit 0
+fi
+INDEX=1
+while IFS= read -r backup; do
+    NAME=$(basename "$backup")
+    TS=$(echo "$NAME" | grep -o '[0-9]\{8\}_[0-9]\{6\}$') || true
+    if [[ -n "${TS:-}" ]]; then
+        DATE="${TS:0:4}-${TS:4:2}-${TS:6:2} ${TS:9:2}:${TS:11:2}:${TS:13:2}"
+    else
+        DATE="unknown"
+    fi
+    FILES=$(find "$backup" -type f | wc -l | tr -d ' ')
+    SIZE=$(du -sh "$backup" | cut -f1 | tr -d ' ')
+    echo "$INDEX|$NAME|$DATE|$FILES|$SIZE"
+    INDEX=$((INDEX + 1))
+done <<< "$BACKUPS"
+LIST_BACKUPS
+        )
 
-        RESULT=$(ssh "${SSH_OPTS[@]}" "$SERVER" bash -s "$DEPLOY_DIR" <<'ROLLBACK'
+        [[ "$BACKUP_LIST" == "NONE" ]] && err "No backups found on server"
+
+        # Display backups
+        BACKUP_COUNT=$(echo "$BACKUP_LIST" | wc -l | tr -d ' ')
+
+        echo ""
+        echo -e "${BOLD}Available backups:${NC}"
+        echo ""
+        while IFS='|' read -r idx name date files size; do
+            if [[ "$idx" == "1" ]]; then
+                echo -e "  ${BOLD}[$idx]${NC} $date  ${DIM}($files files, $size)${NC}  ${GREEN}← latest${NC}"
+            else
+                echo -e "  ${BOLD}[$idx]${NC} $date  ${DIM}($files files, $size)${NC}"
+            fi
+        done <<< "$BACKUP_LIST"
+        echo ""
+
+        # Pick backup
+        if [[ "${SKIP_CONFIRM:-}" == "1" ]]; then
+            PICK=1
+            log "Auto-selected latest backup (-y flag)"
+        else
+            read -rp "$(echo -e "${YELLOW}Select backup [1-$BACKUP_COUNT] (default: 1):${NC} ")" PICK
+            PICK="${PICK:-1}"
+        fi
+
+        # Validate
+        if ! [[ "$PICK" =~ ^[0-9]+$ ]] || (( PICK < 1 || PICK > BACKUP_COUNT )); then
+            err "Invalid selection: $PICK"
+        fi
+
+        # Get selected backup name
+        SELECTED_NAME=$(echo "$BACKUP_LIST" | sed -n "${PICK}p" | cut -d'|' -f2)
+        SELECTED_DATE=$(echo "$BACKUP_LIST" | sed -n "${PICK}p" | cut -d'|' -f3)
+
+        echo ""
+        warn "This will replace current deployment with backup from ${BOLD}$SELECTED_DATE${NC}"
+        echo -e "  Server: ${CYAN}$SERVER:$SSH_PORT${NC}"
+        echo -e "  Path:   ${CYAN}$DEPLOY_DIR${NC}"
+        echo ""
+
+        if [[ "${SKIP_CONFIRM:-}" != "1" ]]; then
+            read -rp "$(echo -e "${YELLOW}Rollback now? [y/N]:${NC} ")" answer
+            [[ "$answer" =~ ^[Yy]$ ]] || { warn "Cancelled."; exit 0; }
+        fi
+
+        info "Rolling back to ${BOLD}$SELECTED_DATE${NC} ..."
+
+        RESULT=$(ssh "${SSH_OPTS[@]}" "$SERVER" bash -s "$DEPLOY_DIR" "$SELECTED_NAME" <<'ROLLBACK'
 set -euo pipefail
 DEPLOY_DIR="$1"
-LATEST_BACKUP=$(ls -dt "${DEPLOY_DIR}_backup_"* 2>/dev/null | head -1)
+BACKUP_NAME="$2"
+BACKUP_DIR="$(dirname "$DEPLOY_DIR")/$BACKUP_NAME"
 
-if [[ -z "$LATEST_BACKUP" ]]; then
-    echo "FAIL:No backup found on server"
+if [[ ! -d "$BACKUP_DIR" ]]; then
+    echo "FAIL:Backup not found: $BACKUP_NAME"
     exit 1
 fi
 
 rm -rf "${DEPLOY_DIR:?}"/*
-cp -r "$LATEST_BACKUP"/* "$DEPLOY_DIR"/
-rm -rf "$LATEST_BACKUP"
+cp -r "$BACKUP_DIR"/* "$DEPLOY_DIR"/
+rm -rf "$BACKUP_DIR"
 
 REMAINING=$(ls -d "${DEPLOY_DIR}_backup_"* 2>/dev/null | wc -l | tr -d ' ')
-echo "OK:$(basename "$LATEST_BACKUP"):$REMAINING"
+echo "OK:$REMAINING"
 ROLLBACK
         )
 
         if [[ "$RESULT" == OK:* ]]; then
-            IFS=':' read -r _ BACKUP_NAME REMAINING <<< "$RESULT"
-            log "Rolled back to: ${BOLD}$BACKUP_NAME${NC}"
+            REMAINING="${RESULT#OK:}"
+            log "Rolled back to: ${BOLD}$SELECTED_DATE${NC}"
             [[ "$REMAINING" -gt 0 ]] && info "$REMAINING backup(s) remaining" || warn "No more backups available"
         else
             err "Rollback failed: ${RESULT#FAIL:}"
         fi
+        ;;
+
+    # --- Logs (deploy history) ---
+    logs)
+        load_env
+        check_ssh
+
+        info "Deploy history for ${BOLD}$SERVER:$DEPLOY_DIR${NC}"
+        echo ""
+
+        ssh "${SSH_OPTS[@]}" "$SERVER" bash -s "$DEPLOY_DIR" <<'LOGS'
+set -euo pipefail
+D="$1"
+
+# Current deployment
+if [[ -d "$D" ]] && find "$D" -maxdepth 1 -type f | read -r; then
+    FILES=$(find "$D" -type f | wc -l | tr -d ' ')
+    SIZE=$(du -sh "$D" | cut -f1 | tr -d ' ')
+    MOD=$(stat -c '%Y' "$D" 2>/dev/null || stat -f '%m' "$D" 2>/dev/null)
+    MOD_DATE=$(date -d "@$MOD" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r "$MOD" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
+    echo "  ● CURRENT    $MOD_DATE    $FILES files    $SIZE"
+else
+    echo "  ○ NOT DEPLOYED"
+fi
+
+# Backup history
+BACKUPS=$(ls -dt "${D}_backup_"* 2>/dev/null) || true
+if [[ -n "${BACKUPS:-}" ]]; then
+    INDEX=1
+    while IFS= read -r backup; do
+        NAME=$(basename "$backup")
+        TS=$(echo "$NAME" | grep -o '[0-9]\{8\}_[0-9]\{6\}$') || true
+        if [[ -n "${TS:-}" ]]; then
+            DATE="${TS:0:4}-${TS:4:2}-${TS:6:2} ${TS:9:2}:${TS:11:2}:${TS:13:2}"
+        else
+            DATE="unknown"
+        fi
+        FILES=$(find "$backup" -type f | wc -l | tr -d ' ')
+        SIZE=$(du -sh "$backup" | cut -f1 | tr -d ' ')
+        echo "  ○ BACKUP #$INDEX  $DATE    $FILES files    $SIZE"
+        INDEX=$((INDEX + 1))
+    done <<< "$BACKUPS"
+else
+    echo "  (no backups)"
+fi
+LOGS
+        ;;
+
+    # --- SSH into server ---
+    ssh)
+        load_env
+        info "Connecting to ${BOLD}$SERVER:$SSH_PORT${NC} ..."
+        exec ssh "${SSH_OPTS[@]}" "$SERVER"
         ;;
 
     # --- Status ---
@@ -419,7 +867,7 @@ set -euo pipefail
 D="$1"
 
 if [[ ! -d "$D" ]]; then
-    echo "  Status: NOT DEPLOYED"
+    echo "  Status:   NOT DEPLOYED"
     exit 0
 fi
 
@@ -429,11 +877,14 @@ MODIFIED=$(stat -c '%Y' "$D" 2>/dev/null || stat -f '%m' "$D" 2>/dev/null)
 MODIFIED_DATE=$(date -d "@$MODIFIED" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$MODIFIED" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "unknown")
 
 BACKUPS=$(ls -d "${D}_backup_"* 2>/dev/null | wc -l | tr -d ' ')
+DISK_FREE=$(df -h "$D" | tail -1 | awk '{print $4}')
 
+echo "  Status:   DEPLOYED"
 echo "  Files:    $FILE_COUNT"
 echo "  Size:     $DIR_SIZE"
 echo "  Modified: $MODIFIED_DATE"
 echo "  Backups:  $BACKUPS"
+echo "  Disk:     $DISK_FREE free"
 STATUS
         ;;
 
@@ -449,11 +900,15 @@ STATUS
         echo -e "${BOLD}Commands:${NC}"
         echo "  dploy               Deploy detected build folder to server"
         echo "  dploy build         Build first, then deploy"
-        echo "  dploy rollback      Rollback to previous version"
+        echo "  dploy rollback      Pick and restore a backup version"
+        echo "  dploy logs          Show deploy history and backups"
+        echo "  dploy ssh           SSH into the server"
         echo "  dploy status        Check current deployment on server"
+        echo "  dploy doctor        Run all checks (SSH, perms, disk, config)"
         echo "  dploy update        Update dploy to latest version"
-        echo "  dploy init          Create .env template in current dir"
+        echo "  dploy init          Create .env, .env.example, .dployignore"
         echo "  dploy install       Install globally to /usr/local/bin"
+        echo "  dploy uninstall     Remove dploy from system"
         echo ""
         echo -e "${BOLD}Flags:${NC}"
         echo "  -y, --yes           Skip confirmation prompts"
@@ -462,7 +917,14 @@ STATUS
         echo "  SERVER              SSH target (e.g. root@192.168.1.10)"
         echo "  DEPLOY_DIR          Absolute path on server (e.g. /var/www/app)"
         echo "  SSH_KEY             SSH private key (default: auto-detect)"
+        echo "  SSH_PORT            SSH port (default: 22)"
         echo "  BUILD_CMD           Build command (default: npm run build)"
+        echo "  POST_DEPLOY_CMD     Command to run on server after deploy"
+        echo ""
+        echo -e "${BOLD}Files:${NC}"
+        echo "  .env                Server and deploy configuration"
+        echo "  .env.example        Committable template for teammates"
+        echo "  .dployignore        Exclude patterns (e.g. *.map, __tests__)"
         echo ""
         echo -e "${BOLD}Auto-detected build folders:${NC} dist/, build/, out/, .next/"
         ;;
