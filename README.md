@@ -244,7 +244,7 @@ dploy update
 
 ## Requirements
 
-- `bash` 4+
+- `bash` 3.2+
 - `ssh` / `scp`
 - `tar`
 - `curl` (for updates)
